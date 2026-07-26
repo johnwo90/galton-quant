@@ -1,0 +1,902 @@
+//@version=6
+strategy(
+    "Galton Crowd Quant — Active Self-Optimizer v5.1",
+    overlay = true,
+    scale = scale.none,
+    behind_chart = false,
+    max_bars_back = 5000,
+    max_lines_count = 500,
+    max_labels_count = 250,
+    pyramiding = 0,
+    initial_capital = 100000,
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 10,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.05,
+    process_orders_on_close = true,
+    calc_on_every_tick = true,
+    calc_on_order_fills = true
+)
+
+// ============================================================================
+// Policy and visuals only. Model, execution and risk parameters are internal.
+// ============================================================================
+
+const string GROUP_POLICY = "0. Policy"
+bool allowLong = input.bool(true, "Allow long", group = GROUP_POLICY)
+bool allowShort = input.bool(true, "Allow short", group = GROUP_POLICY)
+int maximumForecastCandles = input.int(20, "Maximum projected candles", minval = 3, maxval = 40, group = GROUP_POLICY)
+
+const string GROUP_VISUAL = "1. Visuals"
+bool showProjectedCandles = input.bool(true, "Show projected OHLC candles", group = GROUP_VISUAL)
+bool showForecastPath = input.bool(false, "Show projected close path", group = GROUP_VISUAL)
+bool showUncertainty = input.bool(true, "Show 50/80/95% uncertainty", group = GROUP_VISUAL)
+bool showPredictionResults = input.bool(true, "Show resolved predictions", group = GROUP_VISUAL)
+bool showOutcomeLabels = input.bool(false, "Show HIT / PART / MISS labels", group = GROUP_VISUAL)
+bool showTrendBars = input.bool(true, "Colour bars by active forecast", group = GROUP_VISUAL)
+bool showDashboard = input.bool(true, "Show dashboard", group = GROUP_VISUAL)
+
+// ============================================================================
+// Constants and genes
+// ============================================================================
+
+const int AGENT_COUNT = 8
+const int GENE_COUNT = 10
+const int MAX_HORIZON = 40
+const int RESIDUAL_CAPACITY = 180
+const float ONE_WAY_COST_PCT = 0.05
+const float ROUND_TRIP_COST_PCT = 2.0 * ONE_WAY_COST_PCT
+const int WARMUP_BARS = 180
+const int MIN_PROVISIONAL_TRADES = 3
+const int MIN_VALIDATED_TRADES = 8
+
+const int G_SPEED = 0
+const int G_TREND_WEIGHT = 1
+const int G_REVERSION_WEIGHT = 2
+const int G_PULLBACK_WEIGHT = 3
+const int G_CONFIDENCE_GATE = 4
+const int G_EDGE_GATE = 5
+const int G_STOP_ATR = 6
+const int G_REWARD_RISK = 7
+const int G_HOLD_BARS = 8
+const int G_TRAIL_ATR = 9
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+f_clamp(float value, float lower, float upper) =>
+    na(value) ? lower : math.max(lower, math.min(upper, value))
+
+f_clamp_int(int value, int lower, int upper) =>
+    math.max(lower, math.min(upper, value))
+
+f_safe_div(float numerator, float denominator) =>
+    na(numerator) or na(denominator) or math.abs(denominator) < 1e-10 ? 0.0 : numerator / denominator
+
+f_pct(float currentValue, float previousValue) =>
+    100.0 * f_safe_div(currentValue - previousValue, previousValue)
+
+f_sign(float value) =>
+    na(value) ? 0.0 : value > 0.0 ? 1.0 : value < 0.0 ? -1.0 : 0.0
+
+f_squash(float value) =>
+    na(value) ? 0.0 : value / (1.0 + math.abs(value))
+
+f_signed(float value, string pattern) =>
+    (value > 0.0 ? "+" : "") + str.tostring(value, pattern)
+
+f_clear_lines(array<line> lines) =>
+    while array.size(lines) > 0
+        line.delete(array.pop(lines))
+
+f_clear_fills(array<linefill> fills) =>
+    while array.size(fills) > 0
+        linefill.delete(array.pop(fills))
+
+f_gene_index(int agentIndex, int geneIndex) =>
+    agentIndex * GENE_COUNT + geneIndex
+
+f_gene_min(int geneIndex) =>
+    switch geneIndex
+        G_SPEED => 0.0
+        G_TREND_WEIGHT => 0.10
+        G_REVERSION_WEIGHT => 0.0
+        G_PULLBACK_WEIGHT => 0.0
+        G_CONFIDENCE_GATE => 0.40
+        G_EDGE_GATE => 0.10
+        G_STOP_ATR => 0.60
+        G_REWARD_RISK => 0.70
+        G_HOLD_BARS => 3.0
+        => 0.0
+
+f_gene_max(int geneIndex) =>
+    switch geneIndex
+        G_SPEED => 1.0
+        G_TREND_WEIGHT => 1.60
+        G_REVERSION_WEIGHT => 1.50
+        G_PULLBACK_WEIGHT => 2.00
+        G_CONFIDENCE_GATE => 0.75
+        G_EDGE_GATE => 1.60
+        G_STOP_ATR => 4.50
+        G_REWARD_RISK => 4.00
+        G_HOLD_BARS => 48.0
+        => 4.00
+
+f_gene_get(array<float> genes, int agentIndex, int geneIndex) =>
+    array.get(genes, f_gene_index(agentIndex, geneIndex))
+
+f_gene_set(array<float> genes, int agentIndex, int geneIndex, float value) =>
+    float bounded = f_clamp(value, f_gene_min(geneIndex), f_gene_max(geneIndex))
+    if geneIndex == G_HOLD_BARS
+        bounded := math.round(bounded)
+    array.set(genes, f_gene_index(agentIndex, geneIndex), bounded)
+    0
+
+f_copy_genes(array<float> genes, int sourceAgent, int destinationAgent) =>
+    for geneIndex = 0 to GENE_COUNT - 1
+        f_gene_set(genes, destinationAgent, geneIndex, f_gene_get(genes, sourceAgent, geneIndex))
+    0
+
+f_noise(int generation, int agentIndex, int geneIndex) =>
+    float a = float(generation * 37 + agentIndex * 71 + geneIndex * 19 + 11)
+    float b = float(generation * 17 + agentIndex * 43 + geneIndex * 31 + 7)
+    0.62 * math.sin(a * 1.61803398875) + 0.38 * math.sin(b * 0.754877666)
+
+f_profit_factor(float grossProfit, float grossLoss) =>
+    grossLoss > 0.0 ? grossProfit / grossLoss : grossProfit > 0.0 ? 5.0 : 0.0
+
+f_expectancy(float sumReturns, int trades) =>
+    trades > 0 ? sumReturns / float(trades) : 0.0
+
+f_expectancy_lcb(float sumReturns, float sumSquares, int trades) =>
+    float mean = f_expectancy(sumReturns, trades)
+    float variance = trades > 1 ? math.max(sumSquares / float(trades) - mean * mean, 0.0) : 0.0
+    float standardError = trades > 1 ? math.sqrt(variance / float(trades)) : math.abs(mean)
+    mean - 0.45 * standardError
+
+f_quantile(array<float> source, float q) =>
+    array<float> work = array.new_float()
+    for index = 0 to array.size(source) - 1
+        float value = array.get(source, index)
+        if not na(value)
+            array.push(work, value)
+    float result = na
+    int count = array.size(work)
+    if count > 0
+        array.sort(work, order.ascending)
+        int qIndex = f_clamp_int(int(math.round(float(count - 1) * f_clamp(q, 0.0, 1.0))), 0, count - 1)
+        result := array.get(work, qIndex)
+    result
+
+// ============================================================================
+// Symmetric market features
+// ============================================================================
+
+float ret1 = f_pct(close, close[1])
+float tr = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+float atr = ta.atr(14)
+float atrPct = math.abs(close) > syminfo.mintick ? 100.0 * atr / math.abs(close) : 0.0
+float tickPct = 100.0 * syminfo.mintick / math.max(math.abs(close), syminfo.mintick)
+float deadbandPct = math.max(tickPct * 2.0, atrPct * 0.035)
+
+float ema5 = ta.ema(close, 5)
+float ema9 = ta.ema(close, 9)
+float ema13 = ta.ema(close, 13)
+float ema21 = ta.ema(close, 21)
+float ema34 = ta.ema(close, 34)
+float ema55 = ta.ema(close, 55)
+float ema89 = ta.ema(close, 89)
+
+float trendFast = f_pct(ema5, ema13)
+float trendMedium = f_pct(ema13, ema34)
+float trendSlow = f_pct(ema34, ema89)
+float slopeFast = f_pct(ema9, ema9[1])
+float slopeMedium = f_pct(ema21, ema21[1])
+float slopeSlow = f_pct(ema55, ema55[1])
+float acceleration = slopeFast - nz(slopeFast[1], slopeFast)
+
+float rsi = ta.rsi(close, 14)
+float rsiCentered = (rsi - 50.0) / 50.0
+float basis = ta.sma(close, 20)
+float deviation = ta.stdev(close, 20)
+float zScore = f_safe_div(close - basis, deviation)
+float vwapGap = f_pct(close, ta.vwap(hlc3))
+float barRange = math.max(high - low, syminfo.mintick)
+float body = f_safe_div(close - open, barRange)
+float closeLocation = 2.0 * f_safe_div(close - low, barRange) - 1.0
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+float wickRejection = f_safe_div(lowerWick - upperWick, barRange)
+float volumeRatio = f_safe_div(nz(volume), ta.sma(nz(volume), 20))
+float volumeImpulse = body * f_clamp(volumeRatio, 0.0, 3.0)
+
+float macdLine = ta.ema(close, 12) - ta.ema(close, 26)
+float macdSignal = ta.ema(macdLine, 9)
+float macdHistogram = macdLine - macdSignal
+float macdPct = 100.0 * f_safe_div(macdHistogram, close)
+float macdDeceleration = macdPct - nz(macdPct[1], macdPct)
+
+float directionalEfficiency = f_clamp(math.abs(close - close[20]) / math.max(ta.sum(math.abs(ta.change(close)), 20), syminfo.mintick), 0.0, 1.0)
+float trendStrength = f_clamp(math.abs(ema13 - ema55) / math.max(atr * 2.0, syminfo.mintick), 0.0, 1.0)
+float directionalRegime = f_clamp(0.55 * directionalEfficiency + 0.45 * trendStrength, 0.0, 1.0)
+
+// Trend continuation is strictly symmetric.
+float trendCore =
+    0.23 * trendFast +
+    0.22 * trendMedium +
+    0.16 * trendSlow +
+    0.17 * slopeFast +
+    0.12 * slopeMedium +
+    0.10 * macdPct
+
+// Mean reversion is strictly symmetric around VWAP/Bollinger/RSI.
+float reversionCore = f_clamp(
+    -0.34 * zScore * atrPct -
+    0.28 * rsiCentered * atrPct -
+    0.22 * vwapGap +
+    0.16 * wickRejection * atrPct,
+    -atrPct * 1.8,
+    atrPct * 1.8
+)
+
+// Pullback/correction detector. A mature bullish trend can emit a bearish
+// forecast before the medium/slow trend averages turn down, and vice versa.
+float bullishExtension = f_clamp((close - ema21) / math.max(atr, syminfo.mintick), 0.0, 3.0) / 3.0
+float bearishExtension = f_clamp((ema21 - close) / math.max(atr, syminfo.mintick), 0.0, 3.0) / 3.0
+float bearishExhaustion =
+    0.24 * bullishExtension +
+    0.18 * f_clamp((rsi - 62.0) / 23.0, 0.0, 1.0) +
+    0.16 * f_clamp(zScore / 2.5, 0.0, 1.0) +
+    0.16 * f_clamp(-acceleration / math.max(atrPct * 0.05, 0.001), 0.0, 1.0) +
+    0.14 * f_clamp(-macdDeceleration / math.max(atrPct * 0.015, 0.0001), 0.0, 1.0) +
+    0.12 * f_clamp(-wickRejection, 0.0, 1.0)
+float bullishExhaustion =
+    0.24 * bearishExtension +
+    0.18 * f_clamp((38.0 - rsi) / 23.0, 0.0, 1.0) +
+    0.16 * f_clamp(-zScore / 2.5, 0.0, 1.0) +
+    0.16 * f_clamp(acceleration / math.max(atrPct * 0.05, 0.001), 0.0, 1.0) +
+    0.14 * f_clamp(macdDeceleration / math.max(atrPct * 0.015, 0.0001), 0.0, 1.0) +
+    0.12 * f_clamp(wickRejection, 0.0, 1.0)
+float pullbackCore = (bullishExhaustion - bearishExhaustion) * atrPct * 1.35
+
+// Shock/reversal input is not allowed to be averaged away by slow trend terms.
+float shockCore = f_clamp(
+    0.34 * ret1 +
+    0.24 * acceleration +
+    0.18 * macdDeceleration +
+    0.14 * wickRejection * atrPct +
+    0.10 * volumeImpulse * atrPct,
+    -atrPct * 1.8,
+    atrPct * 1.8
+)
+
+bool ready = bar_index > 120 and not na(atr) and not na(ema89)
+
+// ============================================================================
+// Agent population and rolling shadow execution
+// ============================================================================
+
+var array<float> genes = array.new_float(AGENT_COUNT * GENE_COUNT, 0.0)
+var array<float> predictions = array.new_float(AGENT_COUNT, 0.0)
+var array<float> confidences = array.new_float(AGENT_COUNT, 0.5)
+var array<float> noises = array.new_float(AGENT_COUNT, 0.1)
+var array<int> signals = array.new_int(AGENT_COUNT, 0)
+var array<float> priorPredictions = array.new_float(AGENT_COUNT, 0.0)
+var array<float> directionScores = array.new_float(AGENT_COUNT, 0.5)
+
+var array<int> shadowPosition = array.new_int(AGENT_COUNT, 0)
+var array<float> shadowEntry = array.new_float(AGENT_COUNT, na)
+var array<float> shadowEntryAtr = array.new_float(AGENT_COUNT, na)
+var array<float> shadowExtreme = array.new_float(AGENT_COUNT, na)
+var array<int> shadowBars = array.new_int(AGENT_COUNT, 0)
+var array<float> grossProfit = array.new_float(AGENT_COUNT, 0.0)
+var array<float> grossLoss = array.new_float(AGENT_COUNT, 0.0)
+var array<float> sumReturns = array.new_float(AGENT_COUNT, 0.0)
+var array<float> sumSquares = array.new_float(AGENT_COUNT, 0.0)
+var array<int> tradeCounts = array.new_int(AGENT_COUNT, 0)
+var array<int> winCounts = array.new_int(AGENT_COUNT, 0)
+var array<float> equities = array.new_float(AGENT_COUNT, 1.0)
+var array<float> peakEquities = array.new_float(AGENT_COUNT, 1.0)
+var array<float> maxDrawdowns = array.new_float(AGENT_COUNT, 0.0)
+var array<float> fitnesses = array.new_float(AGENT_COUNT, -1.0)
+var int generation = 0
+var int replacements = 0
+
+if barstate.isfirst
+    for agentIndex = 0 to AGENT_COUNT - 1
+        float n = float(agentIndex) / float(AGENT_COUNT - 1)
+        f_gene_set(genes, agentIndex, G_SPEED, n)
+        f_gene_set(genes, agentIndex, G_TREND_WEIGHT, 0.35 + 1.05 * n)
+        f_gene_set(genes, agentIndex, G_REVERSION_WEIGHT, 0.15 + 1.10 * float((agentIndex * 3) % AGENT_COUNT) / float(AGENT_COUNT - 1))
+        f_gene_set(genes, agentIndex, G_PULLBACK_WEIGHT, 0.35 + 1.45 * float((agentIndex * 5) % AGENT_COUNT) / float(AGENT_COUNT - 1))
+        f_gene_set(genes, agentIndex, G_CONFIDENCE_GATE, 0.43 + 0.24 * float((agentIndex * 2) % AGENT_COUNT) / float(AGENT_COUNT - 1))
+        f_gene_set(genes, agentIndex, G_EDGE_GATE, 0.18 + 1.12 * float((agentIndex * 4) % AGENT_COUNT) / float(AGENT_COUNT - 1))
+        f_gene_set(genes, agentIndex, G_STOP_ATR, 0.8 + 2.7 * float((agentIndex * 3) % AGENT_COUNT) / float(AGENT_COUNT - 1))
+        f_gene_set(genes, agentIndex, G_REWARD_RISK, 0.9 + 2.5 * float((agentIndex * 5) % AGENT_COUNT) / float(AGENT_COUNT - 1))
+        f_gene_set(genes, agentIndex, G_HOLD_BARS, 5.0 + 35.0 * n)
+        f_gene_set(genes, agentIndex, G_TRAIL_ATR, agentIndex % 3 == 0 ? 0.0 : 0.8 + 2.4 * n)
+
+for agentIndex = 0 to AGENT_COUNT - 1
+    float speed = f_gene_get(genes, agentIndex, G_SPEED)
+    float trendWeight = f_gene_get(genes, agentIndex, G_TREND_WEIGHT)
+    float reversionWeight = f_gene_get(genes, agentIndex, G_REVERSION_WEIGHT)
+    float pullbackWeight = f_gene_get(genes, agentIndex, G_PULLBACK_WEIGHT)
+    float trendShare = f_clamp(directionalRegime * (0.55 + 0.45 * speed), 0.0, 1.0)
+    float rangingShare = 1.0 - trendShare
+    float prediction =
+        trendCore * trendWeight * trendShare +
+        reversionCore * reversionWeight * rangingShare +
+        pullbackCore * pullbackWeight * (0.45 + 0.55 * directionalRegime) +
+        shockCore * (0.25 + 0.55 * speed)
+    prediction := f_clamp(prediction, -atrPct * 2.2, atrPct * 2.2)
+
+    float componentAgreement = f_clamp(
+        1.0 - (
+            math.abs(f_sign(trendCore) - f_sign(prediction)) * 0.18 +
+            math.abs(f_sign(reversionCore) - f_sign(prediction)) * rangingShare * 0.12 +
+            math.abs(f_sign(pullbackCore) - f_sign(prediction)) * 0.20
+        ),
+        0.0,
+        1.0
+    )
+    float pullbackConviction = f_clamp(math.abs(bullishExhaustion - bearishExhaustion), 0.0, 1.0)
+    float confidence = f_clamp(
+        0.30 * componentAgreement +
+        0.25 * array.get(directionScores, agentIndex) +
+        0.20 * f_clamp(math.abs(prediction) / math.max(atrPct, 0.001), 0.0, 1.0) +
+        0.15 * (1.0 - math.min(math.abs(volumeRatio - 1.0), 1.0)) +
+        0.10 * pullbackConviction,
+        0.0,
+        1.0
+    )
+    float noise = math.max(deadbandPct, atrPct * (0.13 + 0.17 * (1.0 - directionalRegime)))
+    int holdBars = int(math.round(f_gene_get(genes, agentIndex, G_HOLD_BARS)))
+    float pathEdge = math.abs(prediction) * math.sqrt(float(math.max(holdBars, 1))) * (0.55 + 0.45 * directionalRegime)
+    float edgeRatio = pathEdge / math.max(noise, 0.0001)
+    bool directionIsReal = math.abs(prediction) > deadbandPct
+    bool gate = ready and directionIsReal and confidence >= f_gene_get(genes, agentIndex, G_CONFIDENCE_GATE) and edgeRatio >= f_gene_get(genes, agentIndex, G_EDGE_GATE) and pathEdge > ROUND_TRIP_COST_PCT * 0.75
+    int signal = gate ? (prediction > 0.0 ? 1 : -1) : 0
+
+    array.set(predictions, agentIndex, prediction)
+    array.set(confidences, agentIndex, confidence)
+    array.set(noises, agentIndex, noise)
+    array.set(signals, agentIndex, signal)
+
+if ready and barstate.isconfirmed
+    float realizedDirection = math.abs(ret1) <= deadbandPct ? 0.0 : f_sign(ret1)
+    for agentIndex = 0 to AGENT_COUNT - 1
+        float priorPrediction = array.get(priorPredictions, agentIndex)
+        if realizedDirection != 0.0 and math.abs(priorPrediction) > deadbandPct
+            float hit = f_sign(priorPrediction) == realizedDirection ? 1.0 : 0.0
+            float oldScore = array.get(directionScores, agentIndex)
+            array.set(directionScores, agentIndex, oldScore + 0.035 * (hit - oldScore))
+
+        int position = array.get(shadowPosition, agentIndex)
+        float entryPrice = array.get(shadowEntry, agentIndex)
+        float entryAtrValue = array.get(shadowEntryAtr, agentIndex)
+        float extreme = array.get(shadowExtreme, agentIndex)
+        int barsHeld = array.get(shadowBars, agentIndex)
+        int signal = array.get(signals, agentIndex)
+        bool closed = false
+
+        if position != 0 and not na(entryPrice) and not na(entryAtrValue)
+            extreme := position > 0 ? math.max(nz(extreme, entryPrice), high) : math.min(nz(extreme, entryPrice), low)
+            float stopAtrGene = f_gene_get(genes, agentIndex, G_STOP_ATR)
+            float rewardRiskGene = f_gene_get(genes, agentIndex, G_REWARD_RISK)
+            float trailAtrGene = f_gene_get(genes, agentIndex, G_TRAIL_ATR)
+            int holdGene = int(math.round(f_gene_get(genes, agentIndex, G_HOLD_BARS)))
+            float fixedStop = position > 0 ? entryPrice - entryAtrValue * stopAtrGene : entryPrice + entryAtrValue * stopAtrGene
+            float trailingStop = position > 0 ? extreme - atr * trailAtrGene : extreme + atr * trailAtrGene
+            float activeStop = trailAtrGene > 0.10 ? (position > 0 ? math.max(fixedStop, trailingStop) : math.min(fixedStop, trailingStop)) : fixedStop
+            float target = position > 0 ? entryPrice + entryAtrValue * stopAtrGene * rewardRiskGene : entryPrice - entryAtrValue * stopAtrGene * rewardRiskGene
+            bool stopHit = position > 0 ? low <= activeStop : high >= activeStop
+            bool targetHit = position > 0 ? high >= target : low <= target
+            bool opposite = signal != 0 and signal != position
+            bool timeExit = barsHeld + 1 >= holdGene
+            float exitPrice = na
+
+            if stopHit
+                exitPrice := activeStop
+                closed := true
+            else if targetHit
+                exitPrice := target
+                closed := true
+            else if opposite or timeExit
+                exitPrice := close
+                closed := true
+
+            if closed
+                float pnlPct = float(position) * f_pct(exitPrice, entryPrice) - ROUND_TRIP_COST_PCT
+                array.set(sumReturns, agentIndex, array.get(sumReturns, agentIndex) * 0.997 + pnlPct)
+                array.set(sumSquares, agentIndex, array.get(sumSquares, agentIndex) * 0.997 + pnlPct * pnlPct)
+                array.set(tradeCounts, agentIndex, array.get(tradeCounts, agentIndex) + 1)
+                if pnlPct > 0.0
+                    array.set(grossProfit, agentIndex, array.get(grossProfit, agentIndex) * 0.997 + pnlPct)
+                    array.set(winCounts, agentIndex, array.get(winCounts, agentIndex) + 1)
+                else
+                    array.set(grossLoss, agentIndex, array.get(grossLoss, agentIndex) * 0.997 + math.abs(pnlPct))
+                float equity = array.get(equities, agentIndex) * math.max(0.01, 1.0 + pnlPct / 100.0)
+                float peak = math.max(array.get(peakEquities, agentIndex), equity)
+                float drawdown = peak > 0.0 ? (peak - equity) / peak : 0.0
+                array.set(equities, agentIndex, equity)
+                array.set(peakEquities, agentIndex, peak)
+                array.set(maxDrawdowns, agentIndex, math.max(array.get(maxDrawdowns, agentIndex), drawdown))
+                position := 0
+                entryPrice := na
+                entryAtrValue := na
+                extreme := na
+                barsHeld := 0
+            else
+                barsHeld += 1
+
+        if position == 0 and not closed and signal != 0
+            position := signal
+            entryPrice := close
+            entryAtrValue := atr
+            extreme := close
+            barsHeld := 0
+
+        array.set(shadowPosition, agentIndex, position)
+        array.set(shadowEntry, agentIndex, entryPrice)
+        array.set(shadowEntryAtr, agentIndex, entryAtrValue)
+        array.set(shadowExtreme, agentIndex, extreme)
+        array.set(shadowBars, agentIndex, barsHeld)
+
+// Fitness is dominated by realized trading expectancy, but provisional models
+// can still trade before statistical validation is complete.
+int bestAgent = 0
+int worstAgent = 0
+float bestFitness = -1000.0
+float worstFitness = 1000.0
+for agentIndex = 0 to AGENT_COUNT - 1
+    int trades = array.get(tradeCounts, agentIndex)
+    float pf = f_profit_factor(array.get(grossProfit, agentIndex), array.get(grossLoss, agentIndex))
+    float expectancy = f_expectancy(array.get(sumReturns, agentIndex), trades)
+    float lcb = f_expectancy_lcb(array.get(sumReturns, agentIndex), array.get(sumSquares, agentIndex), trades)
+    float drawdown = array.get(maxDrawdowns, agentIndex)
+    float credibility = f_clamp(float(trades) / 20.0, 0.0, 1.0)
+    float fitness =
+        5.0 * lcb +
+        1.6 * expectancy +
+        0.50 * math.log(math.max(pf, 0.20)) +
+        0.30 * (array.get(directionScores, agentIndex) - 0.50) -
+        2.0 * drawdown +
+        0.08 * credibility
+    array.set(fitnesses, agentIndex, fitness)
+    if fitness > bestFitness
+        bestFitness := fitness
+        bestAgent := agentIndex
+    if fitness < worstFitness
+        worstFitness := fitness
+        worstAgent := agentIndex
+
+bool evolve = ready and barstate.isconfirmed and bar_index % 120 == 0 and bar_index > WARMUP_BARS
+if evolve and worstAgent != bestAgent
+    generation += 1
+    f_copy_genes(genes, bestAgent, worstAgent)
+    float mutationAmplitude = array.get(tradeCounts, bestAgent) >= MIN_VALIDATED_TRADES ? 0.08 : 0.17
+    for geneIndex = 0 to GENE_COUNT - 1
+        float parentValue = f_gene_get(genes, bestAgent, geneIndex)
+        float range = f_gene_max(geneIndex) - f_gene_min(geneIndex)
+        f_gene_set(genes, worstAgent, geneIndex, parentValue + f_noise(generation, worstAgent, geneIndex) * range * mutationAmplitude)
+    array.set(grossProfit, worstAgent, 0.0)
+    array.set(grossLoss, worstAgent, 0.0)
+    array.set(sumReturns, worstAgent, 0.0)
+    array.set(sumSquares, worstAgent, 0.0)
+    array.set(tradeCounts, worstAgent, 0)
+    array.set(winCounts, worstAgent, 0)
+    array.set(equities, worstAgent, 1.0)
+    array.set(peakEquities, worstAgent, 1.0)
+    array.set(maxDrawdowns, worstAgent, 0.0)
+    array.set(shadowPosition, worstAgent, 0)
+    array.set(shadowEntry, worstAgent, na)
+    array.set(shadowEntryAtr, worstAgent, na)
+    replacements += 1
+
+int bestTrades = array.get(tradeCounts, bestAgent)
+float bestPf = f_profit_factor(array.get(grossProfit, bestAgent), array.get(grossLoss, bestAgent))
+float bestExpectancy = f_expectancy(array.get(sumReturns, bestAgent), bestTrades)
+float bestLcb = f_expectancy_lcb(array.get(sumReturns, bestAgent), array.get(sumSquares, bestAgent), bestTrades)
+float bestWinRate = bestTrades > 0 ? 100.0 * float(array.get(winCounts, bestAgent)) / float(bestTrades) : 0.0
+bool statisticallyValidated = bestTrades >= MIN_VALIDATED_TRADES and bestPf > 1.0 and bestLcb > 0.0
+bool provisionalQualified = bestTrades >= MIN_PROVISIONAL_TRADES and bestFitness > -0.30
+bool discoveryQualified = bar_index > WARMUP_BARS and bestFitness > -0.65
+string qualificationMode = statisticallyValidated ? "VALIDATED" : provisionalQualified ? "PROVISIONAL" : discoveryQualified ? "DISCOVERY" : "WARMUP"
+
+float activePrediction = array.get(predictions, bestAgent)
+float activeConfidence = array.get(confidences, bestAgent)
+float activeNoise = array.get(noises, bestAgent)
+int activeHoldBars = int(math.round(f_gene_get(genes, bestAgent, G_HOLD_BARS)))
+float activePathEdge = math.abs(activePrediction) * math.sqrt(float(math.max(activeHoldBars, 1))) * (0.55 + 0.45 * directionalRegime)
+int activeSignal = array.get(signals, bestAgent)
+bool modelCanTrade = statisticallyValidated or provisionalQualified or discoveryQualified
+bool activeEntryGate = modelCanTrade and activeSignal != 0 and activePathEdge > ROUND_TRIP_COST_PCT * (statisticallyValidated ? 0.85 : provisionalQualified ? 1.00 : 1.20)
+int tradeSignal = activeEntryGate ? activeSignal : 0
+
+// ============================================================================
+// Actual strategy execution
+// ============================================================================
+
+var int liveEntryBar = na
+var float liveEntryAtr = na
+var float liveStopAtr = na
+var float liveRewardRisk = na
+var float liveTrailAtr = na
+var int liveMaximumBars = na
+var float liveExtreme = na
+
+bool newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+if newLong or newShort
+    liveEntryBar := bar_index
+    liveEntryAtr := atr
+    liveStopAtr := f_gene_get(genes, bestAgent, G_STOP_ATR)
+    liveRewardRisk := f_gene_get(genes, bestAgent, G_REWARD_RISK)
+    liveTrailAtr := f_gene_get(genes, bestAgent, G_TRAIL_ATR)
+    liveMaximumBars := activeHoldBars
+    liveExtreme := close
+
+if strategy.position_size != 0
+    liveExtreme := strategy.position_size > 0 ? math.max(nz(liveExtreme, high), high) : math.min(nz(liveExtreme, low), low)
+
+bool timedExit = strategy.position_size != 0 and not na(liveEntryBar) and bar_index - liveEntryBar >= nz(liveMaximumBars, 20)
+bool oppositeExit = strategy.position_size > 0 and tradeSignal < 0 or strategy.position_size < 0 and tradeSignal > 0
+
+if barstate.isconfirmed
+    if strategy.position_size == 0
+        if allowLong and tradeSignal > 0
+            strategy.entry("Long", strategy.long, comment = qualificationMode + " long")
+        else if allowShort and tradeSignal < 0
+            strategy.entry("Short", strategy.short, comment = qualificationMode + " short")
+    else
+        if strategy.position_size > 0 and (timedExit or oppositeExit)
+            strategy.close("Long", comment = oppositeExit ? "Model reversal" : "Adaptive time exit")
+        if strategy.position_size < 0 and (timedExit or oppositeExit)
+            strategy.close("Short", comment = oppositeExit ? "Model reversal" : "Adaptive time exit")
+
+float riskAtr = nz(liveEntryAtr, atr)
+float stopDistance = riskAtr * nz(liveStopAtr, 1.5)
+float targetDistance = stopDistance * nz(liveRewardRisk, 1.5)
+if strategy.position_size > 0
+    float fixedStop = strategy.position_avg_price - stopDistance
+    float trailingStop = nz(liveTrailAtr, 0.0) > 0.10 ? liveExtreme - atr * liveTrailAtr : fixedStop
+    strategy.exit("Long risk", from_entry = "Long", stop = math.max(fixedStop, trailingStop), limit = strategy.position_avg_price + targetDistance)
+if strategy.position_size < 0
+    float fixedStop = strategy.position_avg_price + stopDistance
+    float trailingStop = nz(liveTrailAtr, 0.0) > 0.10 ? liveExtreme + atr * liveTrailAtr : fixedStop
+    strategy.exit("Short risk", from_entry = "Short", stop = math.min(fixedStop, trailingStop), limit = strategy.position_avg_price - targetDistance)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    liveEntryBar := na
+    liveEntryAtr := na
+    liveStopAtr := na
+    liveRewardRisk := na
+    liveTrailAtr := na
+    liveMaximumBars := na
+    liveExtreme := na
+
+// ============================================================================
+// Causal forecast evaluation and residual quantiles
+// ============================================================================
+
+var bool previousForecastReady = false
+var float previousOrigin = na
+var float previousTarget = na
+var float previousPredictionPct = na
+var float previousLower80 = na
+var float previousUpper80 = na
+var array<float> positiveResiduals = array.new_float(RESIDUAL_CAPACITY, na)
+var array<float> negativeResiduals = array.new_float(RESIDUAL_CAPACITY, na)
+var int residualIndex = 0
+var int residualCount = 0
+var float directionAccuracy = 0.5
+var float range80Coverage = 0.8
+var float meanAbsoluteError = 0.0
+var int hitCount = 0
+var int partialCount = 0
+var int missCount = 0
+
+bool evaluated = previousForecastReady and not na(previousOrigin)
+float realizedPct = evaluated ? f_pct(close, previousOrigin) : na
+bool directionHit = evaluated and math.abs(realizedPct) > deadbandPct and f_sign(previousPredictionPct) == f_sign(realizedPct)
+bool range80Hit = evaluated and close >= previousLower80 and close <= previousUpper80
+color resultColor = directionHit and range80Hit ? color.lime : directionHit ? color.orange : color.red
+
+if evaluated and barstate.isconfirmed
+    float residual = realizedPct - previousPredictionPct
+    array.set(positiveResiduals, residualIndex, math.max(residual, 0.0))
+    array.set(negativeResiduals, residualIndex, math.max(-residual, 0.0))
+    residualIndex := (residualIndex + 1) % RESIDUAL_CAPACITY
+    residualCount := math.min(residualCount + 1, RESIDUAL_CAPACITY)
+    float alpha = 0.035
+    if math.abs(realizedPct) > deadbandPct
+        directionAccuracy += alpha * ((directionHit ? 1.0 : 0.0) - directionAccuracy)
+    range80Coverage += alpha * ((range80Hit ? 1.0 : 0.0) - range80Coverage)
+    meanAbsoluteError += alpha * (math.abs(residual) - meanAbsoluteError)
+    if directionHit and range80Hit
+        hitCount += 1
+    else if directionHit
+        partialCount += 1
+    else
+        missCount += 1
+
+var float qPos50 = na
+var float qNeg50 = na
+var float qPos80 = na
+var float qNeg80 = na
+var float qPos95 = na
+var float qNeg95 = na
+if barstate.isconfirmed and residualCount >= 12 and bar_index % 5 == 0
+    qPos50 := f_quantile(positiveResiduals, 0.50)
+    qNeg50 := f_quantile(negativeResiduals, 0.50)
+    qPos80 := f_quantile(positiveResiduals, 0.80)
+    qNeg80 := f_quantile(negativeResiduals, 0.80)
+    qPos95 := f_quantile(positiveResiduals, 0.95)
+    qNeg95 := f_quantile(negativeResiduals, 0.95)
+
+float upper50Pct = nz(qPos50, atrPct * 0.30)
+float lower50Pct = nz(qNeg50, atrPct * 0.30)
+float upper80Pct = nz(qPos80, atrPct * 0.70)
+float lower80Pct = nz(qNeg80, atrPct * 0.70)
+float upper95Pct = nz(qPos95, atrPct * 1.20)
+float lower95Pct = nz(qNeg95, atrPct * 1.20)
+
+// ============================================================================
+// Recursive forecast path and projected candles
+// ============================================================================
+
+var array<float> projectedOpen = array.new_float(MAX_HORIZON, na)
+var array<float> projectedClose = array.new_float(MAX_HORIZON, na)
+var array<float> projectedHigh = array.new_float(MAX_HORIZON, na)
+var array<float> projectedLow = array.new_float(MAX_HORIZON, na)
+var array<float> projectedUpper50 = array.new_float(MAX_HORIZON, na)
+var array<float> projectedLower50 = array.new_float(MAX_HORIZON, na)
+var array<float> projectedUpper80 = array.new_float(MAX_HORIZON, na)
+var array<float> projectedLower80 = array.new_float(MAX_HORIZON, na)
+var array<float> projectedUpper95 = array.new_float(MAX_HORIZON, na)
+var array<float> projectedLower95 = array.new_float(MAX_HORIZON, na)
+
+float persistence = f_clamp(0.30 + 0.55 * directionalRegime + 0.15 * array.get(directionScores, bestAgent), 0.30, 0.90)
+int forecastHorizon = f_clamp_int(int(math.round(3.0 + float(maximumForecastCandles - 3) * persistence)), 3, maximumForecastCandles)
+float projectedPrice = close
+float priorStep = activePrediction
+for horizon = 1 to MAX_HORIZON
+    if horizon <= forecastHorizon
+        float candleOpen = projectedPrice
+        float decay = math.pow(0.78 + 0.14 * persistence, float(horizon - 1))
+        float correctionPressure = pullbackCore * math.pow(0.72, float(horizon - 1))
+        float stepPct = horizon == 1 ? activePrediction : activePrediction * decay + priorStep * 0.18 * persistence + correctionPressure * 0.22 - f_pct(projectedPrice, ema21) * 0.05 * float(horizon - 1)
+        stepPct := f_clamp(stepPct, -atrPct * 1.8, atrPct * 1.8)
+        projectedPrice *= 1.0 + stepPct / 100.0
+        priorStep := stepPct
+        float horizonScale = math.sqrt(float(horizon)) * (1.0 + 0.30 * (1.0 - activeConfidence))
+        float projectedRange = atr * math.sqrt(1.0 + 0.10 * float(horizon - 1))
+        float candleHigh = math.max(candleOpen, projectedPrice) + projectedRange * 0.35
+        float candleLow = math.min(candleOpen, projectedPrice) - projectedRange * 0.35
+        array.set(projectedOpen, horizon - 1, candleOpen)
+        array.set(projectedClose, horizon - 1, projectedPrice)
+        array.set(projectedHigh, horizon - 1, candleHigh)
+        array.set(projectedLow, horizon - 1, candleLow)
+        array.set(projectedUpper50, horizon - 1, projectedPrice * (1.0 + upper50Pct * horizonScale / 100.0))
+        array.set(projectedLower50, horizon - 1, projectedPrice * (1.0 - lower50Pct * horizonScale / 100.0))
+        array.set(projectedUpper80, horizon - 1, projectedPrice * (1.0 + upper80Pct * horizonScale / 100.0))
+        array.set(projectedLower80, horizon - 1, projectedPrice * (1.0 - lower80Pct * horizonScale / 100.0))
+        array.set(projectedUpper95, horizon - 1, projectedPrice * (1.0 + upper95Pct * horizonScale / 100.0))
+        array.set(projectedLower95, horizon - 1, projectedPrice * (1.0 - lower95Pct * horizonScale / 100.0))
+    else
+        array.set(projectedOpen, horizon - 1, na)
+        array.set(projectedClose, horizon - 1, na)
+        array.set(projectedHigh, horizon - 1, na)
+        array.set(projectedLow, horizon - 1, na)
+        array.set(projectedUpper50, horizon - 1, na)
+        array.set(projectedLower50, horizon - 1, na)
+        array.set(projectedUpper80, horizon - 1, na)
+        array.set(projectedLower80, horizon - 1, na)
+        array.set(projectedUpper95, horizon - 1, na)
+        array.set(projectedLower95, horizon - 1, na)
+
+float oneStepTarget = array.get(projectedClose, 0)
+float oneStepLower80 = array.get(projectedLower80, 0)
+float oneStepUpper80 = array.get(projectedUpper80, 0)
+float terminalTarget = array.get(projectedClose, forecastHorizon - 1)
+float terminalPredictionPct = f_pct(terminalTarget, close)
+
+// ============================================================================
+// Visualization
+// ============================================================================
+
+plot(showPredictionResults and evaluated ? previousTarget : na, "Resolved predicted close", color = resultColor, linewidth = 4, style = plot.style_circles, force_overlay = true)
+plotshape(showPredictionResults and evaluated and directionHit and range80Hit ? low - atr * 0.15 : na, "Prediction hit", shape.circle, location.absolute, color.lime, size = size.tiny, force_overlay = true)
+plotshape(showPredictionResults and evaluated and directionHit and not range80Hit ? low - atr * 0.15 : na, "Prediction partial", shape.diamond, location.absolute, color.orange, size = size.tiny, force_overlay = true)
+plotshape(showPredictionResults and evaluated and not directionHit ? high + atr * 0.15 : na, "Prediction miss", shape.xcross, location.absolute, color.red, size = size.tiny, force_overlay = true)
+
+var array<line> resolvedLines = array.new_line()
+var array<label> resolvedLabels = array.new_label()
+if showPredictionResults and evaluated and barstate.isconfirmed
+    line tether = line.new(bar_index - 1, previousOrigin, bar_index, previousTarget, xloc = xloc.bar_index, color = color.new(resultColor, 8), width = 2, force_overlay = true)
+    line error = line.new(bar_index, previousTarget, bar_index, close, xloc = xloc.bar_index, color = color.new(resultColor, 18), style = line.style_dotted, width = 2, force_overlay = true)
+    array.push(resolvedLines, tether)
+    array.push(resolvedLines, error)
+    while array.size(resolvedLines) > 110
+        line.delete(array.shift(resolvedLines))
+    if showOutcomeLabels
+        string text = directionHit and range80Hit ? "HIT" : directionHit ? "PART" : "MISS"
+        float y = directionHit ? low - atr * 0.28 : high + atr * 0.28
+        label outcome = label.new(bar_index, y, text, xloc = xloc.bar_index, yloc = yloc.price, style = directionHit ? label.style_label_up : label.style_label_down, color = color.new(resultColor, 15), textcolor = color.white, size = size.tiny, force_overlay = true)
+        array.push(resolvedLabels, outcome)
+        while array.size(resolvedLabels) > 55
+            label.delete(array.shift(resolvedLabels))
+
+color trendColor = activePrediction > deadbandPct ? color.lime : activePrediction < -deadbandPct ? color.red : color.silver
+barcolor(showTrendBars ? color.new(trendColor, 58) : na)
+plotshape(tradeSignal > 0 and strategy.position_size == 0, "Long signal", shape.triangleup, location.belowbar, color.lime, size = size.tiny, text = "L", force_overlay = true)
+plotshape(tradeSignal < 0 and strategy.position_size == 0, "Short signal", shape.triangledown, location.abovebar, color.red, size = size.tiny, text = "S", force_overlay = true)
+
+var array<line> futureLines = array.new_line()
+var array<linefill> futureFills = array.new_linefill()
+var label pathLabel = na
+if barstate.islast
+    f_clear_fills(futureFills)
+    f_clear_lines(futureLines)
+    if not na(pathLabel)
+        label.delete(pathLabel)
+        pathLabel := na
+
+    for pathIndex = 0 to forecastHorizon - 1
+        int x1 = bar_index + pathIndex
+        int x2 = x1 + 1
+        float y1 = pathIndex == 0 ? close : array.get(projectedClose, pathIndex - 1)
+        float y2 = array.get(projectedClose, pathIndex)
+        color segmentColor = y2 >= y1 ? color.lime : color.red
+        if showForecastPath
+            line path = line.new(x1, y1, x2, y2, xloc = xloc.bar_index, color = color.new(segmentColor, showProjectedCandles ? 45 : 0), width = showProjectedCandles ? 1 : 3, force_overlay = true)
+            array.push(futureLines, path)
+        if showProjectedCandles
+            float o = array.get(projectedOpen, pathIndex)
+            float h = array.get(projectedHigh, pathIndex)
+            float l = array.get(projectedLow, pathIndex)
+            float c = array.get(projectedClose, pathIndex)
+            color candleColor = c >= o ? color.lime : color.red
+            line wick = line.new(x2, l, x2, h, xloc = xloc.bar_index, color = color.new(candleColor, 20), width = 1, force_overlay = true)
+            line bodyLine = line.new(x2, o, x2, c, xloc = xloc.bar_index, color = candleColor, width = 6, force_overlay = true)
+            array.push(futureLines, wick)
+            array.push(futureLines, bodyLine)
+        if showUncertainty
+            float u50a = pathIndex == 0 ? close : array.get(projectedUpper50, pathIndex - 1)
+            float u50b = array.get(projectedUpper50, pathIndex)
+            float l50a = pathIndex == 0 ? close : array.get(projectedLower50, pathIndex - 1)
+            float l50b = array.get(projectedLower50, pathIndex)
+            float u80a = pathIndex == 0 ? close : array.get(projectedUpper80, pathIndex - 1)
+            float u80b = array.get(projectedUpper80, pathIndex)
+            float l80a = pathIndex == 0 ? close : array.get(projectedLower80, pathIndex - 1)
+            float l80b = array.get(projectedLower80, pathIndex)
+            float u95a = pathIndex == 0 ? close : array.get(projectedUpper95, pathIndex - 1)
+            float u95b = array.get(projectedUpper95, pathIndex)
+            float l95a = pathIndex == 0 ? close : array.get(projectedLower95, pathIndex - 1)
+            float l95b = array.get(projectedLower95, pathIndex)
+            line upper50 = line.new(x1, u50a, x2, u50b, xloc = xloc.bar_index, color = color.new(color.aqua, 20), force_overlay = true)
+            line lower50 = line.new(x1, l50a, x2, l50b, xloc = xloc.bar_index, color = color.new(color.aqua, 20), force_overlay = true)
+            line upper80 = line.new(x1, u80a, x2, u80b, xloc = xloc.bar_index, color = color.new(color.aqua, 45), force_overlay = true)
+            line lower80 = line.new(x1, l80a, x2, l80b, xloc = xloc.bar_index, color = color.new(color.aqua, 45), force_overlay = true)
+            line upper95 = line.new(x1, u95a, x2, u95b, xloc = xloc.bar_index, color = color.new(color.aqua, 68), force_overlay = true)
+            line lower95 = line.new(x1, l95a, x2, l95b, xloc = xloc.bar_index, color = color.new(color.aqua, 68), force_overlay = true)
+            array.push(futureLines, upper50)
+            array.push(futureLines, lower50)
+            array.push(futureLines, upper80)
+            array.push(futureLines, lower80)
+            array.push(futureLines, upper95)
+            array.push(futureLines, lower95)
+            array.push(futureFills, linefill.new(upper50, lower50, color.new(color.aqua, 76)))
+            array.push(futureFills, linefill.new(upper80, lower80, color.new(color.aqua, 88)))
+            array.push(futureFills, linefill.new(upper95, lower95, color.new(color.aqua, 94)))
+
+    pathLabel := label.new(bar_index + forecastHorizon, terminalTarget, f_signed(terminalPredictionPct, "#.##") + "%", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.new(trendColor, 30), textcolor = color.white, force_overlay = true)
+
+// ============================================================================
+// Dashboard
+// ============================================================================
+
+var table dashboard = table.new(position.top_right, 4, 16, border_width = 1, frame_width = 1, force_overlay = true)
+if barstate.islast and showDashboard
+    color sectionCell = color.new(color.gray, 35)
+    color labelCell = color.new(color.rgb(42, 46, 56), 8)
+    color valueCell = color.new(color.rgb(28, 31, 39), 8)
+    float strategyWinRate = strategy.closedtrades > 0 ? 100.0 * float(strategy.wintrades) / float(strategy.closedtrades) : 0.0
+    float strategyPf = strategy.grossloss > 0.0 ? strategy.grossprofit / strategy.grossloss : strategy.grossprofit > 0.0 ? 99.0 : 0.0
+    string positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+
+    table.cell(dashboard, 0, 0, "GALTON CROWD", bgcolor = sectionCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 0, "FORECAST", bgcolor = sectionCell, text_color = color.white)
+    table.cell(dashboard, 2, 0, "STRATEGY", bgcolor = sectionCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 0, "LIVE", bgcolor = sectionCell, text_color = color.white)
+
+    table.cell(dashboard, 0, 1, "Next candle", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 1, f_signed(activePrediction, "#.###") + "%", bgcolor = valueCell, text_color = activePrediction >= 0.0 ? color.lime : color.red)
+    table.cell(dashboard, 2, 1, "Closed trades", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 1, str.tostring(strategy.closedtrades), bgcolor = valueCell, text_color = color.aqua)
+
+    table.cell(dashboard, 0, 2, str.tostring(forecastHorizon) + "-bar path", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 2, f_signed(terminalPredictionPct, "#.##") + "%", bgcolor = valueCell, text_color = terminalPredictionPct >= 0.0 ? color.lime : color.red)
+    table.cell(dashboard, 2, 2, "Win rate", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 2, str.tostring(strategyWinRate, "#.1") + "%", bgcolor = valueCell, text_color = strategyWinRate >= 50.0 ? color.lime : color.red)
+
+    table.cell(dashboard, 0, 3, "Direction accuracy", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 3, str.tostring(directionAccuracy * 100.0, "#.1") + "%", bgcolor = valueCell, text_color = directionAccuracy >= 0.5 ? color.lime : color.red)
+    table.cell(dashboard, 2, 3, "Net profit", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 3, f_signed(strategy.netprofit_percent, "#.2") + "%", bgcolor = valueCell, text_color = strategy.netprofit_percent >= 0.0 ? color.lime : color.red)
+
+    table.cell(dashboard, 0, 4, "80% coverage / MAE", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 4, str.tostring(range80Coverage * 100.0, "#.1") + "% / " + str.tostring(meanAbsoluteError, "#.###") + "%", bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 4, "Profit factor", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 4, str.tostring(strategyPf, "#.2"), bgcolor = valueCell, text_color = strategyPf >= 1.0 ? color.lime : color.red)
+
+    table.cell(dashboard, 0, 5, "Resolved H/P/M", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 5, str.tostring(hitCount) + "/" + str.tostring(partialCount) + "/" + str.tostring(missCount), bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 5, "Max drawdown", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 5, str.tostring(strategy.max_drawdown_percent, "#.2") + "%", bgcolor = valueCell, text_color = strategy.max_drawdown_percent <= 10.0 ? color.lime : color.orange)
+
+    table.cell(dashboard, 0, 6, "Trend / reversion", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 6, f_signed(trendCore, "#.###") + "/" + f_signed(reversionCore, "#.###"), bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 6, "Position", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 6, positionText, bgcolor = valueCell, text_color = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.silver)
+
+    table.cell(dashboard, 0, 7, "Pullback forecast", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 7, f_signed(pullbackCore, "#.###") + "%", bgcolor = valueCell, text_color = pullbackCore >= 0.0 ? color.lime : color.red)
+    table.cell(dashboard, 2, 7, "Trade signal", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 7, tradeSignal > 0 ? "LONG" : tradeSignal < 0 ? "SHORT" : "WAIT", bgcolor = valueCell, text_color = tradeSignal > 0 ? color.lime : tradeSignal < 0 ? color.red : color.orange)
+
+    table.cell(dashboard, 0, 8, "Bull / bear exhaustion", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 8, str.tostring(bullishExhaustion * 100.0, "#.0") + "/" + str.tostring(bearishExhaustion * 100.0, "#.0") + "%", bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 8, "Qualification", bgcolor = sectionCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 8, qualificationMode, bgcolor = sectionCell, text_color = statisticallyValidated ? color.lime : qualificationMode == "WARMUP" ? color.silver : color.orange)
+
+    table.cell(dashboard, 0, 9, "Forecast confidence", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 9, str.tostring(activeConfidence * 100.0, "#.1") + "%", bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 9, "Best PF / win", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 9, str.tostring(bestPf, "#.2") + "/" + str.tostring(bestWinRate, "#.1") + "%", bgcolor = valueCell, text_color = bestPf >= 1.0 ? color.lime : color.red)
+
+    table.cell(dashboard, 0, 10, "Path edge / cost", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 10, str.tostring(activePathEdge, "#.###") + "/" + str.tostring(ROUND_TRIP_COST_PCT, "#.###") + "%", bgcolor = valueCell, text_color = activePathEdge > ROUND_TRIP_COST_PCT ? color.lime : color.red)
+    table.cell(dashboard, 2, 10, "Expectancy / LCB", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 10, f_signed(bestExpectancy, "#.###") + "/" + f_signed(bestLcb, "#.###") + "%", bgcolor = valueCell, text_color = bestLcb > 0.0 ? color.lime : color.red)
+
+    table.cell(dashboard, 0, 11, "Regime directionality", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 11, str.tostring(directionalRegime * 100.0, "#.1") + "%", bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 11, "Best shadow trades", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 11, str.tostring(bestTrades), bgcolor = valueCell, text_color = bestTrades >= MIN_VALIDATED_TRADES ? color.lime : color.orange)
+
+    table.cell(dashboard, 0, 12, "Agent fitness", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 12, str.tostring(bestFitness, "#.3"), bgcolor = valueCell, text_color = bestFitness > 0.0 ? color.lime : color.orange)
+    table.cell(dashboard, 2, 12, "Generation / replaced", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 12, str.tostring(generation) + "/" + str.tostring(replacements), bgcolor = valueCell, text_color = color.aqua)
+
+    table.cell(dashboard, 0, 13, "Risk SL/RR/Hold", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 13, str.tostring(f_gene_get(genes, bestAgent, G_STOP_ATR), "#.2") + "/" + str.tostring(f_gene_get(genes, bestAgent, G_REWARD_RISK), "#.2") + "/" + str.tostring(activeHoldBars), bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 13, "Active agent", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 13, "Agent " + str.tostring(bestAgent + 1), bgcolor = valueCell, text_color = color.aqua)
+
+    table.cell(dashboard, 0, 14, "Residual q80 up/down", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 14, str.tostring(upper80Pct, "#.###") + "/" + str.tostring(lower80Pct, "#.###") + "%", bgcolor = valueCell, text_color = color.white)
+    table.cell(dashboard, 2, 14, "Optimizer target", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 14, "EXPECTANCY + ACTIVITY", bgcolor = valueCell, text_color = color.aqua)
+
+    table.cell(dashboard, 0, 15, "Model parameters", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 1, 15, "SELF-ADJUSTED", bgcolor = valueCell, text_color = color.aqua)
+    table.cell(dashboard, 2, 15, "Correction model", bgcolor = labelCell, text_color = color.white, text_halign = text.align_left)
+    table.cell(dashboard, 3, 15, "SYMMETRIC", bgcolor = valueCell, text_color = color.aqua)
+else if barstate.islast and not showDashboard
+    for column = 0 to 3
+        for row = 0 to 15
+            table.cell(dashboard, column, row, "", bgcolor = color.new(color.black, 100))
+
+// Store current outputs last.
+if barstate.isconfirmed
+    for agentIndex = 0 to AGENT_COUNT - 1
+        array.set(priorPredictions, agentIndex, array.get(predictions, agentIndex))
+    previousForecastReady := ready
+    previousOrigin := close
+    previousTarget := oneStepTarget
+    previousPredictionPct := activePrediction
+    previousLower80 := oneStepLower80
+    previousUpper80 := oneStepUpper80
